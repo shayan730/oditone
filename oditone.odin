@@ -1,90 +1,61 @@
 package oditone
 
-import "base:runtime"
 import "core:fmt"
-import "core:math/rand"
-import "core:mem"
-import "core:os"
-import "core:strconv"
-import "core:time"
+import "core:math"
 import ma "vendor:miniaudio"
+import rl "vendor:raylib"
 
 CHANNELS :: 2
 
 Tone_Context :: struct {
-	waveform:        ma.waveform,
-	rendered_frames: u64,
-	max_frames:      u64,
-	is_finished:     bool,
+	waveform: ma.waveform,
 }
 
 data_callback :: proc "c" (pDevice: ^ma.device, pOutput: rawptr, pInput: rawptr, frameCount: u32) {
-	context = runtime.default_context()
-
 	if pDevice == nil || pOutput == nil do return
 
 	ctx := cast(^Tone_Context)pDevice.pUserData
-	if ctx == nil || ctx.is_finished {
-		// Output silence if finished or invalid context
-		out_slice := mem.slice_ptr(cast(^f32)pOutput, int(frameCount * CHANNELS))
-		mem.zero_slice(out_slice)
-		return
-	}
-	if rand.float32() >= 0.98 {
-		ma.waveform_set_frequency(&ctx.waveform, rand.float64_range(82.41, 1_318.51))
-	}
-	frames_to_read := u64(frameCount)
+	if ctx == nil do return
 
-	// Clamp frames if this batch exceeds total target duration
-	if ctx.rendered_frames + frames_to_read >= ctx.max_frames {
-		frames_to_read = ctx.max_frames - ctx.rendered_frames
-		ctx.is_finished = true
-	}
-
-	if frames_to_read > 0 {
-		ma.waveform_read_pcm_frames(&ctx.waveform, pOutput, frames_to_read, nil)
-		ctx.rendered_frames += frames_to_read
-	}
-
-	// Zero out remaining frames in the buffer to prevent static/clicks
-	if frames_to_read < u64(frameCount) {
-		unwritten_frames := int(u64(frameCount) - frames_to_read)
-		offset_samples := int(frames_to_read) * CHANNELS
-
-		out_ptr := rawptr(uintptr(pOutput) + uintptr(offset_samples * size_of(f32)))
-		remaining_slice := mem.slice_ptr(cast(^f32)out_ptr, unwritten_frames * CHANNELS)
-		mem.zero_slice(remaining_slice)
-	}
+	ma.waveform_read_pcm_frames(&ctx.waveform, pOutput, u64(frameCount), nil)
 }
 
-parse_inputs :: proc(args: []string) -> (f64, f64) {
-	if len(args) == 3 {
-		freq_val, freq_ok := strconv.parse_f64(args[1])
-		sec_val, sec_ok := strconv.parse_f64(args[2])
-		if freq_ok && sec_ok {
-			return freq_val, sec_val
-		}
-	}
-	return 440.0, 2.0
+// Map a normalized value [0.0, 1.0] to dynamic knob angle limits
+get_knob_angle :: proc(value: f32, min_angle: f32 = -135.0, max_angle: f32 = 135.0) -> f32 {
+	return min_angle + value * (max_angle - min_angle)
 }
 
 main :: proc() {
 	SAMPLE_RATE :: 44100
 
-	freq, duration_sec := parse_inputs(os.args)
+	// 1. Initialize Raylib Window
+	rl.InitWindow(800, 400, "Oditone")
+	defer rl.CloseWindow()
+	rl.SetTargetFPS(60)
 
 	ctx: Tone_Context
-	ctx.max_frames = u64(duration_sec * f64(SAMPLE_RATE))
 
-	// 1. Configure Waveform Generator
-	sine_config := ma.waveform_config {
-		format     = .f32,
-		channels   = u32(CHANNELS),
-		type       = .sine,
-		amplitude  = 0.2,
-		frequency  = freq,
-		sampleRate = u32(SAMPLE_RATE),
-	}
+	// Frequency limits
+	MIN_FREQ :: 100.0
+	MAX_FREQ :: 1000.0
+	current_freq: f64 = 440.0
+
+	// Knob parameters
+	knob_center := rl.Vector2{400, 260}
+	knob_radius: f32 = 70.0
+	is_dragging := false
+	drag_start_y: f32 = 0.0
+	freq_at_drag_start: f64 = 440.0
+
+	// 2. Configure Miniaudio Waveform
+	sine_config := ma.waveform_config_init(
+		.f32,
+		u32(CHANNELS),
+		u32(SAMPLE_RATE),
+		.sine,
+		0.2,
+		current_freq,
+	)
 
 	if result := ma.waveform_init(&sine_config, &ctx.waveform); result != .SUCCESS {
 		fmt.println("Waveform init failed:", result)
@@ -92,7 +63,7 @@ main :: proc() {
 	}
 	defer ma.waveform_uninit(&ctx.waveform)
 
-	// 2. Configure Output Device
+	// 3. Configure Output Device
 	device_config := ma.device_config_init(.playback)
 	device_config.playback.format = .f32
 	device_config.playback.channels = u32(CHANNELS)
@@ -113,12 +84,72 @@ main :: proc() {
 		return
 	}
 
-	fmt.printf("Playing tone (%.2f Hz) for %.2f seconds...\n", freq, duration_sec)
+	// 4. Main Event Loop
+	for !rl.WindowShouldClose() {
+		mouse_pos := rl.GetMousePosition()
 
-	// Poll until the audio callback finishes tracking frame limit
-	for !ctx.is_finished {
-		time.sleep(10 * time.Millisecond)
+		// Knob interaction: Start dragging on left-click within knob radius
+		if rl.IsMouseButtonPressed(.LEFT) {
+			if rl.CheckCollisionPointCircle(mouse_pos, knob_center, knob_radius) {
+				is_dragging = true
+				drag_start_y = mouse_pos.y
+				freq_at_drag_start = current_freq
+			}
+		}
+
+		if rl.IsMouseButtonReleased(.LEFT) {
+			is_dragging = false
+		}
+
+		// Adjust frequency via vertical dragging (Audio plugin standard style)
+		if is_dragging {
+			delta_y := drag_start_y - mouse_pos.y // Move up to increase frequency
+			sensitivity :: 2.0 // Hz per pixel dragged
+			new_freq := freq_at_drag_start + f64(delta_y * sensitivity)
+			current_freq = math.clamp(new_freq, MIN_FREQ, MAX_FREQ)
+		}
+
+		// Update miniaudio waveform frequency atomically
+		ma.waveform_set_frequency(&ctx.waveform, current_freq)
+
+		// Render UI
+		rl.BeginDrawing()
+		rl.ClearBackground(rl.DARKGRAY)
+
+		rl.DrawText("Audio Control", 20, 20, 24, rl.RAYWHITE)
+		rl.DrawText("Click and drag the knob UP/DOWN to turn", 20, 55, 16, rl.LIGHTGRAY)
+
+		// Calculate visual knob angle
+		normalized_val := f32((current_freq - MIN_FREQ) / (MAX_FREQ - MIN_FREQ))
+		angle_deg := get_knob_angle(normalized_val)
+		angle_rad := angle_deg * math.RAD_PER_DEG
+
+		// Outer Ring Track
+		rl.DrawCircleSector(knob_center, knob_radius + 12, -135, 135, 32, rl.GRAY)
+		rl.DrawCircleSector(knob_center, knob_radius + 12, -135, angle_deg, 32, rl.GREEN)
+
+		// Knob Body
+		knob_color := rl.SKYBLUE if is_dragging else rl.LIGHTGRAY
+		rl.DrawCircleV(knob_center, knob_radius, knob_color)
+		rl.DrawCircleLines(i32(knob_center.x), i32(knob_center.y), knob_radius, rl.WHITE)
+
+		// Knob Indicator Line (Rotates with frequency)
+		indicator_len := knob_radius - 12.0
+		indicator_end := rl.Vector2 {
+			knob_center.x + indicator_len * math.sin(angle_rad),
+			knob_center.y - indicator_len * math.cos(angle_rad),
+		}
+		rl.DrawLineEx(knob_center, indicator_end, 5.0, rl.DARKGRAY)
+
+		// Digital Display
+		rl.DrawText(
+			rl.TextFormat("%.1f Hz", current_freq),
+			i32(knob_center.x) - 60,
+			i32(knob_center.y) + i32(knob_radius) + 30,
+			28,
+			rl.GREEN,
+		)
+
+		rl.EndDrawing()
 	}
-
-	fmt.println("Playback complete.")
 }
